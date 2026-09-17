@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Instrument / data caches — large files, rebuilt per machine on demand
+upstox/instruments_cache/
+
+# Claude Code — machine-specific permissions, not shared
+.claude/
+
+# macOS
+.DS_Store
+
+# Secrets — never commit tokens or keys
+.env
+*.token
+secrets.json
