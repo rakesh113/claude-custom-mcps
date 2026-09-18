@@ -32,6 +32,7 @@ from mcp.server.fastmcp import FastMCP
 # ---------------------------------------------------------------------------
 
 BASE = "https://api.upstox.com"
+BASE_HFT = "https://api-hft.upstox.com"
 IST = ZoneInfo("Asia/Kolkata")
 CACHE_DIR = Path(__file__).parent / "instruments_cache"
 CACHE_DIR.mkdir(exist_ok=True)
@@ -64,9 +65,52 @@ def _headers() -> dict:
     }
 
 
+def _account_headers() -> dict:
+    token = os.environ.get("UPSTOX_API_TOKEN") or os.environ.get("UPSTOX_ACCESS_TOKEN")
+    if not token:
+        raise RuntimeError("UPSTOX_API_TOKEN (or UPSTOX_ACCESS_TOKEN) is not set in environment")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+
 def _get(path: str, params: dict = None) -> dict:
     with httpx.Client(timeout=15) as client:
         r = client.get(f"{BASE}{path}", headers=_headers(), params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+def _account_get(path: str, params: dict = None, base: str = None) -> dict:
+    url_base = base or BASE
+    with httpx.Client(timeout=15) as client:
+        r = client.get(f"{url_base}{path}", headers=_account_headers(), params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+def _account_post(path: str, body: dict, base: str = None) -> dict:
+    url_base = base or BASE_HFT
+    with httpx.Client(timeout=15) as client:
+        r = client.post(f"{url_base}{path}", headers=_account_headers(), json=body)
+        r.raise_for_status()
+        return r.json()
+
+
+def _account_put(path: str, body: dict, base: str = None) -> dict:
+    url_base = base or BASE_HFT
+    with httpx.Client(timeout=15) as client:
+        r = client.put(f"{url_base}{path}", headers=_account_headers(), json=body)
+        r.raise_for_status()
+        return r.json()
+
+
+def _account_delete(path: str, params: dict = None, base: str = None) -> dict:
+    url_base = base or BASE_HFT
+    with httpx.Client(timeout=15) as client:
+        r = client.delete(f"{url_base}{path}", headers=_account_headers(), params=params)
         r.raise_for_status()
         return r.json()
 
@@ -889,6 +933,336 @@ def get_share_holdings(isin: str) -> dict:
 def get_competitors(isin: str) -> dict:
     """Peer/competitor list with instrument_keys for fan-out analysis."""
     return _get(f"/v2/fundamentals/{isin}/competitors")
+
+
+# ---------------------------------------------------------------------------
+# Account — Profile & Funds
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_profile() -> dict:
+    """Fetch authenticated user's profile: name, email, enabled exchanges, order types, products."""
+    return _account_get("/v2/user/profile")
+
+
+@mcp.tool()
+def get_funds_margin(segment: str = "") -> dict:
+    """
+    Detailed balance breakdown: cash available, pledge margin, margin in use, unsettled amounts.
+
+    segment: NSE, BSE, MCX, BFO, NCD — leave empty for all segments.
+    Uses the V3 endpoint with full breakdown.
+    """
+    params = {}
+    if segment:
+        params["segment"] = segment
+    return _account_get("/v3/user/get-funds-and-margin", params=params)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio — Positions & Holdings
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_positions() -> dict:
+    """
+    Current-day trading positions with real-time P&L, quantity, buy average, and margin details
+    for all active intraday and overnight positions.
+    """
+    return _account_get("/v2/portfolio/short-term-positions")
+
+
+@mcp.tool()
+def get_holdings() -> dict:
+    """
+    Long-term demat holdings: quantity, average price, last price, P&L, ISIN, exchange.
+    """
+    return _account_get("/v2/portfolio/long-term-holdings")
+
+
+@mcp.tool()
+def get_mtf_positions() -> dict:
+    """
+    Margin Trade Funding (MTF) positions with quantity, price, and interest details.
+    """
+    return _account_get("/v2/portfolio/mtf-positions")
+
+
+# ---------------------------------------------------------------------------
+# Orders
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_order_book() -> dict:
+    """
+    Complete order book for the trading day — all open, pending, filled, and rejected orders.
+    """
+    return _account_get("/v2/order/retrieve-all")
+
+
+@mcp.tool()
+def get_order_details(order_id: str) -> dict:
+    """
+    Latest status and details for a specific order.
+
+    order_id: the order ID returned when the order was placed.
+    """
+    return _account_get("/v2/order/details", params={"order_id": order_id})
+
+
+@mcp.tool()
+def get_order_history(order_id: str = "", tag: str = "") -> dict:
+    """
+    Full state history of an order — all transitions from placement to execution/rejection.
+
+    Provide either order_id or tag (custom tag set at placement).
+    """
+    params = {}
+    if order_id:
+        params["order_id"] = order_id
+    if tag:
+        params["tag"] = tag
+    return _account_get("/v2/order/history", params=params)
+
+
+@mcp.tool()
+def get_order_trades(order_id: str) -> dict:
+    """
+    All trades (fills) executed for a specific order: fill price, quantity, trade ID.
+
+    order_id: the order ID to query.
+    """
+    return _account_get("/v2/order/trades/get-trades-for-order", params={"order_id": order_id})
+
+
+@mcp.tool()
+def get_trades() -> dict:
+    """
+    All executed trades for the current trading day across all orders.
+    """
+    return _account_get("/v2/order/trades/get-trades-for-day")
+
+
+@mcp.tool()
+def place_order(
+    instrument_token: str,
+    transaction_type: str,
+    quantity: int,
+    order_type: str,
+    product: str,
+    price: float = 0,
+    trigger_price: float = 0,
+    validity: str = "DAY",
+    disclosed_quantity: int = 0,
+    is_amo: bool = False,
+    tag: str = "",
+    market_protection: int = -1,
+) -> dict:
+    """
+    Place a single trading order.
+
+    instrument_token: e.g. NSE_EQ|INE002A01018 (from search_instrument).
+    transaction_type: BUY or SELL.
+    quantity: number of units (or lots for commodity).
+    order_type: MARKET, LIMIT, SL, SL-M.
+    product: I (intraday), D (delivery), MTF.
+    price: limit price — set 0 for MARKET / SL-M orders.
+    trigger_price: required for SL and SL-M orders.
+    validity: DAY (default) or IOC.
+    disclosed_quantity: quantity to show in market depth (0 = full).
+    is_amo: true for After Market Order (auto-detected in practice).
+    tag: optional custom label for this order.
+    market_protection: -1 = auto, 0 = none, 1–25 = custom % (MARKET/SL-M only).
+    """
+    body = {
+        "instrument_token": instrument_token,
+        "transaction_type": transaction_type.upper(),
+        "quantity": quantity,
+        "order_type": order_type.upper(),
+        "product": product.upper(),
+        "price": price,
+        "trigger_price": trigger_price,
+        "validity": validity.upper(),
+        "disclosed_quantity": disclosed_quantity,
+        "is_amo": is_amo,
+        "market_protection": market_protection,
+    }
+    if tag:
+        body["tag"] = tag
+    return _account_post("/v2/order/place", body)
+
+
+@mcp.tool()
+def modify_order(
+    order_id: str,
+    quantity: int = None,
+    price: float = None,
+    order_type: str = None,
+    validity: str = None,
+    trigger_price: float = None,
+    disclosed_quantity: int = None,
+) -> dict:
+    """
+    Modify a pending or open order. Only pass the fields you want to change.
+
+    order_id: the order to modify.
+    quantity: new quantity.
+    price: new limit price.
+    order_type: MARKET, LIMIT, SL, SL-M.
+    validity: DAY or IOC.
+    trigger_price: new trigger price for SL/SL-M.
+    disclosed_quantity: new disclosed quantity.
+    """
+    body: dict = {"order_id": order_id}
+    if quantity is not None:
+        body["quantity"] = quantity
+    if price is not None:
+        body["price"] = price
+    if order_type is not None:
+        body["order_type"] = order_type.upper()
+    if validity is not None:
+        body["validity"] = validity.upper()
+    if trigger_price is not None:
+        body["trigger_price"] = trigger_price
+    if disclosed_quantity is not None:
+        body["disclosed_quantity"] = disclosed_quantity
+    return _account_put("/v2/order/modify", body)
+
+
+@mcp.tool()
+def cancel_order(order_id: str) -> dict:
+    """
+    Cancel a pending or open order.
+
+    order_id: the order ID to cancel.
+    """
+    return _account_delete("/v2/order/cancel", params={"order_id": order_id})
+
+
+# ---------------------------------------------------------------------------
+# P&L and Trade Charges
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_pnl_report(
+    segment: str,
+    financial_year: str,
+    from_date: str = "",
+    to_date: str = "",
+    page_number: int = 1,
+    page_size: int = 50,
+) -> dict:
+    """
+    Trade-wise realised P&L report: buy/sell dates, prices, quantities, amounts per trade.
+
+    segment: EQ (equity), FO (futures & options), COM (commodity), CD (currency derivatives).
+    financial_year: last 2 digits of each year concatenated — e.g. "2425" for FY2024-25.
+    from_date / to_date: optional date range in dd-mm-yyyy format (must be within the FY).
+    page_number: starts at 1.
+    page_size: max records per page (check metadata for total).
+    """
+    params: dict = {
+        "segment": segment,
+        "financial_year": financial_year,
+        "page_number": page_number,
+        "page_size": page_size,
+    }
+    if from_date:
+        params["from_date"] = from_date
+    if to_date:
+        params["to_date"] = to_date
+    return _account_get("/v2/trade/profit-loss/data", params=params)
+
+
+@mcp.tool()
+def get_trade_charges(
+    segment: str,
+    financial_year: str,
+    from_date: str = "",
+    to_date: str = "",
+    page_number: int = 1,
+    page_size: int = 50,
+) -> dict:
+    """
+    Brokerage and statutory charges breakdown per trade.
+
+    segment: EQ, FO, COM, CD.
+    financial_year: e.g. "2425" for FY2024-25.
+    from_date / to_date: optional date range in dd-mm-yyyy format.
+    """
+    params: dict = {
+        "segment": segment,
+        "financial_year": financial_year,
+        "page_number": page_number,
+        "page_size": page_size,
+    }
+    if from_date:
+        params["from_date"] = from_date
+    if to_date:
+        params["to_date"] = to_date
+    return _account_get("/v2/trade/profit-loss/charges", params=params)
+
+
+# ---------------------------------------------------------------------------
+# Mutual Funds
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_mf_holdings() -> dict:
+    """Current mutual fund holdings: scheme name, units, NAV, current value, P&L."""
+    return _account_get("/v2/mf/holdings")
+
+
+@mcp.tool()
+def get_mf_order_book(status: str = "") -> dict:
+    """
+    Mutual fund order book.
+
+    status: optional filter — open, cancelled, completed.
+    """
+    params = {}
+    if status:
+        params["status"] = status
+    return _account_get("/v2/mf/orders", params=params)
+
+
+@mcp.tool()
+def get_mf_order_details(order_id: str) -> dict:
+    """Details for a specific mutual fund order."""
+    return _account_get("/v2/mf/order", params={"order_id": order_id})
+
+
+@mcp.tool()
+def get_mf_sips() -> dict:
+    """List of all active and paused SIPs with scheme details, amount, frequency, and next date."""
+    return _account_get("/v2/mf/sip")
+
+
+# ---------------------------------------------------------------------------
+# Margin
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_margin(
+    instruments: list[dict],
+) -> dict:
+    """
+    Calculate margin required for one or more potential orders (up to 20 instruments).
+    Returns span, exposure, equity, net_buy_premium, total_margin, and final_margin
+    (after margin benefit).
+
+    instruments: list of dicts, each with:
+      instrument_key: e.g. "NSE_EQ|INE002A01018" (from search_instrument)
+      quantity:       int — number of units / lots
+      transaction_type: "BUY" or "SELL"
+      product:        "I", "D", "CO", or "MTF"
+      price:          float (optional) — limit price for more accurate margin calc
+
+    Example:
+      [{"instrument_key": "NSE_EQ|INE002A01018", "quantity": 10,
+        "transaction_type": "BUY", "product": "D"}]
+    """
+    return _account_post("/v2/charges/margin", {"instruments": instruments}, base=BASE)
 
 
 if __name__ == "__main__":
